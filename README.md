@@ -1,53 +1,64 @@
-# gpuval — GPU Validation Toolkit (bit-accurate models + rasterizer verification)
+# gpuval: Bit-Accurate FP16 Model & Tiled Rasterizer Verification
 
-A small C++17 project that practices the day-to-day work of a GPU validation /
-content engineer: write a **bit-accurate C++ model** of a hardware unit, check it
-against **real silicon**, verify a **GPU-style rasterizer** against a golden model,
-and prove the test plan works by **injecting bugs** and showing every one is caught.
+A C++17 validation toolkit for two pieces of GPU hardware behavior: a half-precision
+floating-point unit and a fixed-point triangle rasterizer. Each one has an integer-only
+model, an independent golden reference, and a verification suite, plus a fault-injection
+campaign that plants realistic bugs to measure how strong the test plan is.
 
-No GPU needed. Runs on any x86-64 Linux or WSL2 machine.
+**Headline results**
+- FP16 model is bit-exact against x86 F16C silicon across **all 4,294,967,296** float32 inputs.
+- Add and multiply are bit-exact across **all 4.29 B operand pairs** each.
+- Tiled rasterizer is bit-identical to a brute-force golden model across **208 M** pixel comparisons, with **zero cracks or overdraw** on shared-edge meshes.
+- Coarse tile reject/accept cuts per-pixel edge tests by **97.2%**.
+- **6 of 6** planted hardware bugs are caught, each reported with its first failing vector.
 
-## What's inside
+![Rendered torus](docs/render.png)
 
-| Part | What it is | Why a GPU team cares |
+## Components
+
+| File | Description |
+|---|---|
+| `fp16.cpp` | Integer-only IEEE 754 binary16 unit: float conversion, add, multiply and fused multiply-add. Round-to-nearest-even, subnormals, signed zeros, infinities and NaN. All operations share one `round_pack()` rounding stage, mirroring an FPU's align → compute → normalize → round datapath. |
+| `reference.cpp` | Two independent references: x86 **F16C instructions** (`VCVTPS2PH` / `VCVTPH2PS`) and the compiler's `_Float16` runtime, fed exact results formed in `double` / `__float128` so the only rounding is the final one. |
+| `raster.cpp` | 24.8 fixed-point rasterizer with exact integer edge functions, the **top-left fill rule**, depth test and rounded barycentric interpolation. A brute-force golden model and an **8×8 tiled DUT** with trivial reject/accept and incremental edge stepping. |
+| `test_fp16.cpp` | Multithreaded verification: exhaustive over conversions, add and mul; a directed corner-case cross product; constrained-random FMA biased toward catastrophic cancellation. |
+| `test_raster.cpp` | **Watertightness** on jittered, pixel-center-snapped, sub-pixel and high-valence fan meshes. **Differential** comparison of color, depth and coverage after every triangle. A **CRC32 frame signature** checked against a stored golden value. |
+| `main.cpp` | CLI, scene renderer, and the **fault-injection campaign**. |
+
+## Fault-injection campaign
+
+Each bug is switched on in the device under test only. The campaign records which checks fail and the first failing vector.
+
+| Planted bug | Caught by | First failing vector |
 |---|---|---|
-| `fp16.cpp` | Integer-only model of an IEEE 754 half-precision unit: convert, add, multiply, fused multiply-add. Round-to-nearest-even, subnormals, signed zeros, inf/NaN. | Half precision is the workhorse format for shaders and ML on GPUs. A bit-accurate model is the golden reference RTL is verified against. |
-| `reference.cpp` | Independent references: x86 **F16C instructions** (real silicon) and the compiler's `_Float16` soft-float runtime. | Never verify a model against itself. |
-| `raster.cpp` | Fixed-point (24.8) triangle rasterizer with the **top-left fill rule**, depth test and attribute interpolation. Two versions: brute-force golden model and an **8x8 tiled** version with trivial reject/accept and incremental edge stepping (the DUT). | This is how hardware rasterizers actually decide coverage. |
-| `test_fp16.cpp` | **Exhaustive** verification: all 65,536 halves, all 4,294,967,296 float32 inputs, all 4.29 B operand pairs for add and for mul. Directed corner cases + constrained random for FMA. Multithreaded. | Exhaustive → directed → random is the standard FPU sign-off ladder. |
-| `test_raster.cpp` | **Watertightness** (every pixel of a shared-edge mesh covered exactly once), **differential** testing vs the golden model after every triangle, and a **CRC frame signature**. | Cracks/overdraw on shared edges and golden-signature mismatches are classic GPU bring-up bugs. |
-| `main.cpp` `faults` | **Fault-injection campaign**: plants 6 realistic bugs (wrong tie rounding, flush-to-zero, unfused FMA, missing fill rule, tile-accept bug, truncating interpolation) and reports which check caught each and the first failing vector. | Measures whether the test plan is strong enough. An uncaught bug is an "escape". |
+| Ties round away from zero | conversion, add, mul, fma | `from_float(0x3EDE9000) = 0x36F5`, expected `0x36F4` |
+| Subnormals flushed to zero | conversion, round trip, add, mul, fma | `from_float(0x35DBE63E) = 0x0000`, expected `0x001B` |
+| FMA rounds the product before adding | fma | `fma(0x8001, 0x0001, 0x0000) = +0`, expected `-0` |
+| Fill rule ignored on shared edges | watertight, differential, signature | pixel (20,18) covered 7 times |
+| Tile trivial-accept checks 3 of 4 corners | watertight, differential, signature | pixel (79,1) covered 2 times |
+| Interpolation truncates instead of rounding | differential, signature | green channel `0xA8`, expected `0xA9` |
 
-## Setup (VS Code terminal, Linux or WSL2)
+The FMA case is the most interesting. The exact product −2⁻⁴⁸ is nonzero, so the fused result keeps its sign and rounds to −0. Rounding the product first collapses it to −0, and −0 + +0 gives +0. That one-bit sign difference is invisible to most tests and is caught here only because the model is bit-accurate.
 
-On Windows, open VS Code in WSL (bottom-left `><` button → "Connect to WSL"), then:
-
-```bash
-sudo apt update && sudo apt install -y build-essential cmake
-```
+![Fill-rule bug: red pixels are drawn twice](docs/debug_overdraw.png)
 
 ## Build and run
 
+Requires x86-64 Linux or WSL2 with GCC and CMake.
+
 ```bash
-cd gpuval
+sudo apt install -y build-essential cmake
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./build/gpuval --quick      # everything, small vector counts (~5 s)
-./build/gpuval              # everything, full exhaustive (~1–4 min depending on cores)
+./build/gpuval --quick      # reduced vector counts, a few seconds
+./build/gpuval              # full exhaustive run
 ```
 
-Individual pieces:
+Run one part at a time with `fp16`, `raster`, `faults` or `render`.
 
-```bash
-./build/gpuval fp16         # half-precision model, exhaustive
-./build/gpuval raster       # rasterizer: watertight + differential + signature
-./build/gpuval faults       # bug-injection campaign, writes debug_overdraw.bmp
-./build/gpuval render       # draws a lit torus to render.bmp
-```
+## Results
 
-Open `render.bmp` and `debug_overdraw.bmp` in VS Code to view them.
-
-## Results (2-core cloud VM; faster on a laptop)
+Full exhaustive run: 78 s on a 12-thread desktop.
 
 ```
 [PASS] to_float   exhaustive         65,536 vectors      0 fails
@@ -62,13 +73,8 @@ per-pixel edge tests: 97.2% fewer than brute force
 6 of 6 planted bugs caught
 ```
 
-A favorite catch from the fault campaign: with the unfused-FMA bug,
-`fma(-2^-24, 2^-24, +0)` returns `+0` instead of `-0`. Rounding the tiny product
-first throws away its sign — exactly the kind of one-bit difference a
-bit-accurate model exists to pin down.
+## Next steps
 
-## Ideas to extend
-
-- Add a Vulkan or Metal compute shader that runs the same fp16 vectors on a real GPU and compares to the model.
-- Add perspective-correct interpolation and a texture sampler (bilinear filtering in fixed point).
-- Add a bf16 or fp8 (E4M3/E5M2) model reusing `round_pack()`.
+- Run the same FP16 vectors on a GPU through a Vulkan or Metal compute shader and compare against the model.
+- Add perspective-correct interpolation and a fixed-point bilinear texture sampler.
+- Extend `round_pack()` to bf16 and FP8 (E4M3 / E5M2).
